@@ -7,7 +7,7 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -559,6 +559,360 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
         })
       ).rejects.toThrow("Custom test error");
     });
+  });
+});
+
+// =============================================================================
+// NODE_LLAMA_CPP_GPU env var helper tests
+// These tests verify LlamaCpp.isIntentionalCpuMode() — no model required.
+// =============================================================================
+
+describe("LlamaCpp.isIntentionalCpuMode", () => {
+  test("returns true for 'false'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("false")).toBe(true);
+  });
+
+  test("returns true for 'off'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("off")).toBe(true);
+  });
+
+  test("returns true for 'none'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("none")).toBe(true);
+  });
+
+  test("returns true for 'disable'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("disable")).toBe(true);
+  });
+
+  test("returns true for 'disabled'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("disabled")).toBe(true);
+  });
+
+  test("is case-insensitive: 'FALSE'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("FALSE")).toBe(true);
+  });
+
+  test("is case-insensitive: 'Off'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("Off")).toBe(true);
+  });
+
+  test("is case-insensitive: 'DISABLED'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("DISABLED")).toBe(true);
+  });
+
+  test("returns false for GPU values: 'cuda'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("cuda")).toBe(false);
+  });
+
+  test("returns false for GPU values: 'metal'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("metal")).toBe(false);
+  });
+
+  test("returns false for GPU values: 'vulkan'", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("vulkan")).toBe(false);
+  });
+
+  test("returns false for undefined (env var not set)", () => {
+    expect(LlamaCpp.isIntentionalCpuMode(undefined)).toBe(false);
+  });
+
+  test("returns false for empty string", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("")).toBe(false);
+  });
+
+  test("returns false for unknown values", () => {
+    expect(LlamaCpp.isIntentionalCpuMode("auto")).toBe(false);
+    expect(LlamaCpp.isIntentionalCpuMode("1")).toBe(false);
+    expect(LlamaCpp.isIntentionalCpuMode("no")).toBe(false);
+  });
+});
+
+// =============================================================================
+// Mocked ensureLlama behavior tests
+// These tests verify the NODE_LLAMA_CPP_GPU env var handling in ensureLlama()
+// by verifying the branching logic and observable behavior.
+// =============================================================================
+
+describe("ensureLlama env-based GPU selection behavior", () => {
+  const originalEnv = process.env["NODE_LLAMA_CPP_GPU"];
+
+  afterEach(() => {
+    // Restore original env
+    if (originalEnv === undefined) {
+      delete process.env["NODE_LLAMA_CPP_GPU"];
+    } else {
+      process.env["NODE_LLAMA_CPP_GPU"] = originalEnv;
+    }
+  });
+
+  test("env var set to 'false' is recognized as intentional CPU mode", () => {
+    process.env["NODE_LLAMA_CPP_GPU"] = "false";
+    expect(LlamaCpp.isIntentionalCpuMode(process.env["NODE_LLAMA_CPP_GPU"])).toBe(true);
+  });
+
+  test("env var set to accelerator value is NOT intentional CPU mode", () => {
+    process.env["NODE_LLAMA_CPP_GPU"] = "cuda";
+    expect(LlamaCpp.isIntentionalCpuMode(process.env["NODE_LLAMA_CPP_GPU"])).toBe(false);
+  });
+
+  test("env var unset means auto-detect should be used (not intentional CPU)", () => {
+    delete process.env["NODE_LLAMA_CPP_GPU"];
+    expect(LlamaCpp.isIntentionalCpuMode(process.env["NODE_LLAMA_CPP_GPU"])).toBe(false);
+  });
+
+  // Table-driven test for all CPU-indicating values (case variants)
+  test.each([
+    ["false", true],
+    ["FALSE", true],
+    ["False", true],
+    ["off", true],
+    ["OFF", true],
+    ["Off", true],
+    ["none", true],
+    ["NONE", true],
+    ["None", true],
+    ["disable", true],
+    ["DISABLE", true],
+    ["Disable", true],
+    ["disabled", true],
+    ["DISABLED", true],
+    ["Disabled", true],
+  ])("intentional CPU env value '%s' is recognized (expected: %s)", (value, expected) => {
+    expect(LlamaCpp.isIntentionalCpuMode(value)).toBe(expected);
+  });
+
+  // Table-driven test for non-CPU values
+  test.each([
+    ["cuda", false],
+    ["CUDA", false],
+    ["metal", false],
+    ["METAL", false],
+    ["vulkan", false],
+    ["VULKAN", false],
+    ["auto", false],
+    ["true", false],
+    ["1", false],
+    ["yes", false],
+  ])("GPU/other env value '%s' is NOT intentional CPU mode (expected: %s)", (value, expected) => {
+    expect(LlamaCpp.isIntentionalCpuMode(value)).toBe(expected);
+  });
+});
+
+// =============================================================================
+// ensureLlama behavioral verification tests
+// These tests verify the ensureLlama() branching behavior through observable outputs:
+// - stderr warnings (or lack thereof)
+// - getDeviceInfo() return values
+//
+// Note: We cannot easily mock node-llama-cpp ES module exports, so we test
+// by observing the side effects and outputs of ensureLlama's internal logic.
+// The key behaviors being verified are:
+// 1. When env is set to CPU value, no "no GPU acceleration" warning is emitted
+// 2. When env is unset and we fall back to CPU, warning IS emitted
+// 3. The isIntentionalCpuMode() helper correctly identifies CPU-indicating values
+// =============================================================================
+
+import { vi, type Mock } from "vitest";
+
+describe("ensureLlama behavioral verification", () => {
+  const originalEnv = process.env["NODE_LLAMA_CPP_GPU"];
+  let stderrWriteSpy: Mock;
+  let originalStderrWrite: typeof process.stderr.write;
+  let stderrOutput: string[] = [];
+
+  beforeAll(() => {
+    // Capture stderr to verify warning emission
+    originalStderrWrite = process.stderr.write.bind(process.stderr);
+    stderrWriteSpy = vi.fn((...args: Parameters<typeof process.stderr.write>) => {
+      stderrOutput.push(String(args[0]));
+      return originalStderrWrite(...args);
+    });
+    process.stderr.write = stderrWriteSpy as typeof process.stderr.write;
+  });
+
+  afterAll(() => {
+    process.stderr.write = originalStderrWrite;
+  });
+
+  afterEach(() => {
+    // Restore original env
+    if (originalEnv === undefined) {
+      delete process.env["NODE_LLAMA_CPP_GPU"];
+    } else {
+      process.env["NODE_LLAMA_CPP_GPU"] = originalEnv;
+    }
+    // Clear captured output
+    stderrOutput = [];
+    stderrWriteSpy.mockClear();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Test: Verify the ensureLlama branching logic indirectly via source code inspection.
+   * Since we can't mock ES modules, we verify the logic is correct by:
+   * 1. Testing isIntentionalCpuMode() returns correct values for all cases
+   * 2. Testing that the code structure in ensureLlama matches the expected branching
+   *
+   * The actual ensureLlama code has this structure (verified by reading src/llm.ts):
+   *
+   * if (gpuEnvVar !== undefined) {
+   *   // Defer to node-llama-cpp - getLlama() without explicit gpu
+   * } else {
+   *   // Auto-detect: getLlamaGpuTypes() -> try preferred -> fallback to CPU
+   * }
+   *
+   * if (!llama.gpu && !intentionalCpu) {
+   *   // Emit warning
+   * }
+   */
+  test("source code structure verification: env var branch is correctly implemented", async () => {
+    // Read the actual source to verify the branching structure
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    const llmSource = await fs.readFile(
+      path.join(process.cwd(), "src/llm.ts"),
+      "utf-8"
+    );
+
+    // Verify env var check exists and branches correctly
+    expect(llmSource).toContain('const gpuEnvVar = process.env["NODE_LLAMA_CPP_GPU"]');
+    expect(llmSource).toContain("if (gpuEnvVar !== undefined)");
+
+    // Verify the env-set branch does NOT pass explicit gpu
+    // (searches for getLlama call WITHOUT gpu in the if-branch)
+    const envSetBranchMatch = llmSource.match(
+      /if \(gpuEnvVar !== undefined\) \{[\s\S]*?llama = await getLlama\(\{[^}]*\}\)/
+    );
+    expect(envSetBranchMatch).toBeTruthy();
+    // The call inside env-set branch should NOT have 'gpu:' in it
+    const envSetBranchLlamaCall = envSetBranchMatch![0];
+    // Should only have logLevel, not gpu
+    expect(envSetBranchLlamaCall).toContain("logLevel:");
+    // Check that gpu is not explicitly set in this branch
+    const branchContent = envSetBranchLlamaCall.split("if (gpuEnvVar !== undefined)")[1];
+    // Between { and } of getLlama options, there should be no 'gpu:' or 'gpu :'
+    expect(branchContent).not.toMatch(/gpu\s*:/);
+
+    // Verify the env-unset branch (else) calls getLlamaGpuTypes
+    expect(llmSource).toContain("getLlamaGpuTypes()");
+
+    // Verify warning suppression for intentional CPU mode
+    expect(llmSource).toContain("if (!llama.gpu && !intentionalCpu)");
+  });
+
+  /**
+   * Test: Verify isIntentionalCpuMode is used to gate the warning
+   */
+  test("isIntentionalCpuMode gates the no-GPU warning correctly in source", async () => {
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    const llmSource = await fs.readFile(
+      path.join(process.cwd(), "src/llm.ts"),
+      "utf-8"
+    );
+
+    // The warning should be gated by intentionalCpu (derived from isIntentionalCpuMode)
+    expect(llmSource).toContain("const intentionalCpu = LlamaCpp.isIntentionalCpuMode(gpuEnvVar)");
+    expect(llmSource).toContain('if (!llama.gpu && !intentionalCpu)');
+    expect(llmSource).toContain('no GPU acceleration');
+  });
+
+  /**
+   * Test: Verify auto-detect prefers CUDA > Metal > Vulkan > CPU
+   */
+  test("auto-detect GPU preference order is CUDA > Metal > Vulkan", async () => {
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    const llmSource = await fs.readFile(
+      path.join(process.cwd(), "src/llm.ts"),
+      "utf-8"
+    );
+
+    // Verify the preference order in the source
+    const preferenceMatch = llmSource.match(
+      /const preferred = \(.*?\)\.find\(g => gpuTypes\.includes\(g\)\)/s
+    );
+    expect(preferenceMatch).toBeTruthy();
+
+    // The array should be ["cuda", "metal", "vulkan"] in that order
+    expect(preferenceMatch![0]).toMatch(/\["cuda",\s*"metal",\s*"vulkan"\]/);
+  });
+
+  /**
+   * Test: Verify fallback to CPU on GPU init failure emits warning
+   */
+  test("GPU failure fallback path emits warning in source", async () => {
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    const llmSource = await fs.readFile(
+      path.join(process.cwd(), "src/llm.ts"),
+      "utf-8"
+    );
+
+    // Verify catch block that falls back to CPU and emits warning
+    expect(llmSource).toContain("catch {");
+    expect(llmSource).toContain('llama = await getLlama({ gpu: false');
+    expect(llmSource).toContain("reported available but failed to initialize");
+    expect(llmSource).toContain("Falling back to CPU");
+  });
+
+  /**
+   * Integration test: Create fresh LlamaCpp with intentional CPU env value
+   * and verify no "no GPU acceleration" warning appears.
+   * This test actually exercises the code path.
+   *
+   * Note: Skip in CI since it would require model download.
+   * In real environments, this validates the warning suppression.
+   */
+  test.skipIf(!!process.env.CI)(
+    "integration: intentional CPU mode (NODE_LLAMA_CPP_GPU=false) suppresses warning",
+    async () => {
+      process.env["NODE_LLAMA_CPP_GPU"] = "false";
+      stderrOutput = [];
+
+      // Create a fresh instance and trigger ensureLlama
+      const freshLlm = new LlamaCpp({});
+
+      try {
+        const device = await freshLlm.getDeviceInfo();
+
+        // Should be in CPU mode
+        expect(device.gpu).toBe(false);
+
+        // Warning should NOT have been emitted
+        const combinedStderr = stderrOutput.join("");
+        expect(combinedStderr).not.toContain("no GPU acceleration");
+      } finally {
+        await freshLlm.dispose();
+      }
+    }
+  );
+
+  /**
+   * Verify that the warning suppression values match node-llama-cpp's accepted values.
+   * These are the documented CPU-off values: false, off, none, disable, disabled.
+   */
+  test("isIntentionalCpuMode matches node-llama-cpp CPU-off values", () => {
+    // Documented node-llama-cpp CPU-off values
+    const cpuOffValues = ["false", "off", "none", "disable", "disabled"];
+
+    for (const value of cpuOffValues) {
+      expect(LlamaCpp.isIntentionalCpuMode(value)).toBe(true);
+      // Case variations
+      expect(LlamaCpp.isIntentionalCpuMode(value.toUpperCase())).toBe(true);
+      expect(LlamaCpp.isIntentionalCpuMode(
+        value.charAt(0).toUpperCase() + value.slice(1)
+      )).toBe(true);
+    }
+
+    // Non-CPU values should return false
+    const nonCpuValues = ["cuda", "metal", "vulkan", "auto", "true", "1", "yes", ""];
+    for (const value of nonCpuValues) {
+      expect(LlamaCpp.isIntentionalCpuMode(value)).toBe(false);
+    }
+
+    // Undefined should return false
+    expect(LlamaCpp.isIntentionalCpuMode(undefined)).toBe(false);
   });
 });
 

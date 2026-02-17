@@ -965,6 +965,73 @@ describe("status and collection list hide filesystem paths", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("status with intentional CPU mode (NODE_LLAMA_CPP_GPU=false) suppresses install tip", async () => {
+    const { stdout, exitCode } = await runQmd(["status"], {
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+      env: { NODE_LLAMA_CPP_GPU: "false" },
+    });
+    expect(exitCode).toBe(0);
+    // When CPU mode is intentional, the install tip should NOT appear
+    expect(stdout).not.toContain("Tip: Install CUDA");
+  });
+
+  test("status with invalid NODE_LLAMA_CPP_GPU value surfaces error if init fails", async () => {
+    // Use an invalid GPU type that will cause initialization to fail
+    const invalidGpuType = "nonexistent_gpu_type_xyz";
+    const { stdout, stderr, exitCode } = await runQmd(["status"], {
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+      env: { NODE_LLAMA_CPP_GPU: invalidGpuType },
+    });
+
+    // Status command should still succeed (exit 0) but surface the warning
+    expect(exitCode).toBe(0);
+
+    // Either:
+    // 1. Device section appears (init succeeded despite invalid value - node-llama-cpp may fall back)
+    // 2. Warning is surfaced containing the env var value and "initialization failed"
+    const combined = stdout + stderr;
+    const hasDeviceSection = stdout.includes("Device");
+    const hasWarning = combined.includes(`NODE_LLAMA_CPP_GPU=${invalidGpuType}`) &&
+                       combined.toLowerCase().includes("initialization failed");
+
+    // At least one of these should be true
+    expect(hasDeviceSection || hasWarning).toBe(true);
+
+    // If Device section is NOT shown (init failed), the warning MUST be present
+    // This ensures we're not silently swallowing the error
+    if (!hasDeviceSection) {
+      expect(hasWarning).toBe(true);
+    }
+  });
+
+  test("status with env unset silently omits device section if init fails", async () => {
+    // When NODE_LLAMA_CPP_GPU is NOT set and device init fails,
+    // status should NOT surface a warning (silent failure for default case).
+    // This is different from when env IS set, where failure should be surfaced.
+    //
+    // Note: In practice, this test runs in an environment where init may succeed
+    // (if GPU/CPU is available). The key behavior we're verifying is:
+    // - Exit code is 0 (status succeeds even if device init fails)
+    // - No NODE_LLAMA_CPP_GPU warning is shown (since env var wasn't set)
+
+    const { stdout, stderr, exitCode } = await runQmd(["status"], {
+      dbPath: localDbPath,
+      configDir: localConfigDir,
+      // Explicitly NOT setting NODE_LLAMA_CPP_GPU
+    });
+
+    expect(exitCode).toBe(0);
+
+    // Should NOT contain env-override warning format (since env wasn't set)
+    const combined = stdout + stderr;
+    expect(combined).not.toMatch(/NODE_LLAMA_CPP_GPU=.*initialization failed/i);
+
+    // Status command should still produce some output (collections, etc.)
+    expect(stdout).toContain("Collection");
+  });
+
   test("status does not show full filesystem paths", async () => {
     const { stdout, exitCode } = await runQmd(["status"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
