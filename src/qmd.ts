@@ -68,7 +68,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, LlamaCpp } from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -379,6 +379,8 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
+  const gpuEnvVar = process.env["NODE_LLAMA_CPP_GPU"];
+  const intentionalCpu = LlamaCpp.isIntentionalCpuMode(gpuEnvVar);
   try {
     const llm = getDefaultLlamaCpp();
     const device = await llm.getDeviceInfo();
@@ -401,10 +403,19 @@ async function showStatus(): Promise<void> {
       }
     } else {
       console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      if (!intentionalCpu) {
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      }
     }
     console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
+  } catch (err) {
+    if (gpuEnvVar !== undefined) {
+      // When NODE_LLAMA_CPP_GPU is explicitly set, surface the init failure so users
+      // know their override caused an issue rather than silently omitting device info.
+      process.stderr.write(
+        `QMD Warning: NODE_LLAMA_CPP_GPU=${gpuEnvVar} — LLM initialization failed: ${err instanceof Error ? err.message : String(err)}\n`
+      );
+    }
     // Don't fail status if LLM init fails
   }
 

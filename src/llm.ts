@@ -487,33 +487,59 @@ export class LlamaCpp implements LLM {
   }
 
   /**
+   * Check if NODE_LLAMA_CPP_GPU is set to a value indicating intentional CPU mode.
+   * Matches node-llama-cpp's accepted CPU-off values: false, off, none, disable, disabled (case-insensitive).
+   */
+  static isIntentionalCpuMode(envValue: string | undefined): boolean {
+    if (!envValue) return false;
+    const lower = envValue.toLowerCase();
+    return ["false", "off", "none", "disable", "disabled"].includes(lower);
+  }
+
+  /**
    * Initialize the llama instance (lazy)
+   *
+   * When NODE_LLAMA_CPP_GPU is set, we defer GPU selection to node-llama-cpp by calling
+   * getLlama() without an explicit gpu option. This allows users to control GPU/CPU mode
+   * via the environment variable (e.g., NODE_LLAMA_CPP_GPU=false for CPU-only).
+   *
+   * When NODE_LLAMA_CPP_GPU is not set, we use QMD's auto-detection logic: detect available
+   * GPU types, prefer CUDA > Metal > Vulkan, and fall back to CPU with a warning if GPU init fails.
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      // @ts-expect-error node-llama-cpp API compat
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const gpuEnvVar = process.env["NODE_LLAMA_CPP_GPU"];
+      const intentionalCpu = LlamaCpp.isIntentionalCpuMode(gpuEnvVar);
 
       let llama: Llama;
-      if (preferred) {
-        try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
-          process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
-          );
-        }
+      if (gpuEnvVar !== undefined) {
+        // NODE_LLAMA_CPP_GPU is set — defer to node-llama-cpp to honor the env var.
+        // Do NOT pass an explicit gpu option, which would override the env var.
+        llama = await getLlama({ logLevel: LlamaLogLevel.error });
       } else {
-        llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        // NODE_LLAMA_CPP_GPU is unset — use QMD's auto-detection logic.
+        // We can't rely on gpu:"auto" — it returns false even when CUDA is available
+        // (likely a binary/build config issue in node-llama-cpp).
+        // @ts-expect-error node-llama-cpp API compat
+        const gpuTypes = await getLlamaGpuTypes();
+        // Prefer CUDA > Metal > Vulkan > CPU
+        const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+
+        if (preferred) {
+          try {
+            llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
+          } catch {
+            llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+            process.stderr.write(
+              `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            );
+          }
+        } else {
+          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+        }
       }
 
-      if (!llama.gpu) {
+      if (!llama.gpu && !intentionalCpu) {
         process.stderr.write(
           "QMD Warning: no GPU acceleration, running on CPU (slow). Run 'qmd status' for details.\n"
         );
